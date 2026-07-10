@@ -9,10 +9,18 @@ class Settings(BaseSettings):
     # Default LLM model routed via LiteLLM.
     # Local (no API key needed): "ollama/llama3.1" (requires Ollama running locally)
     # Cloud: "anthropic/claude-sonnet-5", "openai/gpt-4o", etc.
-    default_model: str = "ollama/gemma4:e4b"
+    default_model: str = "ollama/llama3.1"
 
     # Ollama server address (only used for ollama/* models)
     ollama_base_url: str = "http://localhost:11434"
+
+    # Local semantic safety classifier (Phase 1). Pull with:
+    # `ollama pull llama-guard3` — or swap for another guard model.
+    guardrail_model: str = "ollama/llama-guard3"
+
+    # If True, block requests when the classifier itself is unreachable
+    # instead of failing open. Off by default for MVP dev ergonomics.
+    guardrail_fail_closed: bool = False
 
     # Rate limit: requests per minute per API key
     rate_limit_rpm: int = 60
