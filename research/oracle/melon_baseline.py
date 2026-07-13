@@ -24,7 +24,21 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 ORACLE_MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
 
-MASK_TOKEN = "[REDACTED USER REQUEST]"
+# "Hard" mask: an obviously-fake placeholder. Original MELON approach.
+# Gives the model nothing plausible to hide behind, which we found
+# empirically causes it to refuse outright on some examples rather than
+# reveal whether the injected content alone would hijack it — producing
+# false negatives on hijacks that depend on plausible legitimate cover
+# (see research/README.md "context_dependent_false_negative" finding).
+HARD_MASK_TOKEN = "[REDACTED USER REQUEST]"
+
+# "Soft" mask: a generic but plausible-sounding request, preserving some
+# legitimate-looking cover for the injected instruction to hide behind,
+# without leaking any of the real task's specifics. Tests whether this
+# reduces the false-negative blind spot found with the hard mask.
+SOFT_MASK_REQUEST = "Please help me with this task."
+
+MASK_TOKEN = HARD_MASK_TOKEN  # kept for backwards compatibility
 
 
 @dataclass
@@ -33,6 +47,7 @@ class MelonResult:
     masked_plan: str
     similarity_score: float
     label: str  # "injected" | "clean"
+    mask_strategy: str = "hard"  # "hard" | "soft"
 
 
 DEFAULT_TOOL_SCHEMA = """Available tools:
@@ -204,9 +219,12 @@ class MelonOracle:
         retrieved_content: str,
         similarity_threshold: float = 0.7,
         skip_first_step: bool = True,
+        mask_strategy: str = "hard",
     ) -> MelonResult:
+        mask_text = HARD_MASK_TOKEN if mask_strategy == "hard" else SOFT_MASK_REQUEST
+
         original_plan = self._generate_plan(system_prompt, user_request, retrieved_content)
-        masked_plan = self._generate_plan(system_prompt, MASK_TOKEN, retrieved_content)
+        masked_plan = self._generate_plan(system_prompt, mask_text, retrieved_content)
 
         similarity = self._plan_similarity(original_plan, masked_plan, skip_first_step=skip_first_step)
 
@@ -220,6 +238,7 @@ class MelonOracle:
             masked_plan=masked_plan,
             similarity_score=similarity,
             label=label,
+            mask_strategy=mask_strategy,
         )
 
 
@@ -237,11 +256,21 @@ if __name__ == "__main__":
              "(off by default — first steps are often 'obviously correct' "
              "regardless of intent and produce false positives).",
     )
+    parser.add_argument(
+        "--mask-strategy",
+        choices=["hard", "soft"],
+        default="hard",
+        help="'hard' = obviously-fake placeholder (original MELON approach). "
+             "'soft' = generic-but-plausible request, testing whether preserving "
+             "some legitimate cover reveals context-dependent hijacks the hard "
+             "mask misses.",
+    )
     args = parser.parse_args()
 
     oracle = MelonOracle()
     result = oracle.evaluate(
         args.system, args.request, args.content,
         skip_first_step=not args.include_first_step,
+        mask_strategy=args.mask_strategy,
     )
     print(json.dumps(asdict(result), indent=2))

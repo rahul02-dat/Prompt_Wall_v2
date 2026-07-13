@@ -35,6 +35,7 @@ def run_batch(
     out_path: str | None = None,
     skip_first_step: bool = True,
     default_request: str = DEFAULT_REQUEST,
+    mask_strategy: str = "hard",
 ):
     oracle = MelonOracle()
 
@@ -57,7 +58,9 @@ def run_batch(
 
         start = time.time()
         result = oracle.evaluate(
-            DEFAULT_SYSTEM_PROMPT, request, text, skip_first_step=skip_first_step
+            DEFAULT_SYSTEM_PROMPT, request, text,
+            skip_first_step=skip_first_step,
+            mask_strategy=mask_strategy,
         )
         latency = time.time() - start
         total_latency += latency
@@ -72,6 +75,7 @@ def run_batch(
             "oracle_similarity": result.similarity_score,
             "oracle_original_plan": result.original_plan,
             "oracle_masked_plan": result.masked_plan,
+            "mask_strategy": mask_strategy,
             "agrees_with_expected_label": agrees,
             "latency_sec": round(latency, 3),
         }
@@ -130,6 +134,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Include the first tool-call step in similarity scoring (off by default)",
     )
+    parser.add_argument(
+        "--mask-strategy",
+        choices=["hard", "soft"],
+        default="hard",
+        help="'hard' = obviously-fake placeholder (original MELON). "
+             "'soft' = generic-but-plausible request, testing whether it "
+             "reduces false negatives on context-dependent hijacks.",
+    )
     args = parser.parse_args()
 
-    run_batch(args.dataset, out_path=args.out, skip_first_step=not args.include_first_step)
+    run_batch(
+        args.dataset,
+        out_path=args.out,
+        skip_first_step=not args.include_first_step,
+        mask_strategy=args.mask_strategy,
+    )
