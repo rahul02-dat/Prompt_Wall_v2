@@ -2,4 +2,4 @@ pwenv/
 __pycache__/
 tests/
 *.joblib
-*jsonl
+*.jsonl
