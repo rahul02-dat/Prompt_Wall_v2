@@ -16,6 +16,7 @@ Model: meta-llama/Llama-3.1-8B-Instruct (or any local instruct model with
        tool-calling capability) — fp16, not quantized, run locally.
 """
 import json
+import re
 from dataclasses import dataclass, asdict
 
 import torch
@@ -86,29 +87,51 @@ class MelonOracle:
         return generated.strip()
 
     @staticmethod
-    def _try_parse_steps(text: str) -> list[dict] | None:
+    def _strip_json_comments(text: str) -> str:
+        """
+        Models frequently add // or # inline comments despite explicit
+        instructions not to add commentary, which breaks strict json.loads.
+        Strip trailing '// ...' and '# ...' comments per line before parsing.
+        Naive but effective for the common case; doesn't handle comment
+        markers inside string values, which is an acceptable tradeoff here
+        since our tool args are short and unlikely to contain literal '//'.
+        """
+        lines = []
+        for line in text.split("\n"):
+            # Strip // comments
+            line = re.sub(r"//.*$", "", line)
+            # Strip # comments (only if not inside what looks like a string)
+            line = re.sub(r"(?<!['\"])#.*$", "", line)
+            lines.append(line)
+        return "\n".join(lines)
+
+    @classmethod
+    def _try_parse_steps(cls, text: str) -> list[dict] | None:
         """
         Extracts a JSON list of {"tool": ..., "args": {...}} steps from
-        (possibly prose-wrapped) model output. Returns None if no valid
-        list is found. A model that returns a single dict (not wrapped
-        in a list) is normalized to a 1-step list for compatibility.
+        (possibly prose-wrapped, possibly comment-polluted) model output.
+        Returns None if no valid list is found. A model that returns a
+        single dict (not wrapped in a list) is normalized to a 1-step
+        list for compatibility.
         """
-        start = text.find("[")
-        end = text.rfind("]")
+        cleaned = cls._strip_json_comments(text)
+
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
         if start != -1 and end != -1 and end > start:
             try:
-                parsed = json.loads(text[start:end + 1])
+                parsed = json.loads(cleaned[start:end + 1])
                 if isinstance(parsed, list):
                     return parsed
             except (json.JSONDecodeError, ValueError):
                 pass
 
         # Fall back: maybe it emitted a single {"tool": ...} dict instead of a list
-        start = text.find("{")
-        end = text.rfind("}")
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
         if start != -1 and end != -1 and end > start:
             try:
-                parsed = json.loads(text[start:end + 1])
+                parsed = json.loads(cleaned[start:end + 1])
                 if isinstance(parsed, dict) and "tool" in parsed:
                     return [parsed]
             except (json.JSONDecodeError, ValueError):
