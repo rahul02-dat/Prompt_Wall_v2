@@ -73,6 +73,7 @@ def run_batch(
             **row,
             "oracle_label": result.label,
             "oracle_similarity": result.similarity_score,
+            "oracle_max_step_similarity": result.max_step_similarity,
             "oracle_original_plan": result.original_plan,
             "oracle_masked_plan": result.masked_plan,
             "mask_strategy": mask_strategy,

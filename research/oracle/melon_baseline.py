@@ -46,6 +46,7 @@ class MelonResult:
     original_plan: str
     masked_plan: str
     similarity_score: float
+    max_step_similarity: float
     label: str  # "injected" | "clean"
     mask_strategy: str = "hard"  # "hard" | "soft"
 
@@ -165,7 +166,7 @@ class MelonOracle:
 
     def _plan_similarity(
         self, plan_a: str, plan_b: str, skip_first_step: bool = True
-    ) -> float:
+    ) -> tuple[float, float]:
         """
         Compares multi-step trajectories rather than a single tool call.
 
@@ -185,6 +186,18 @@ class MelonOracle:
            the labeled dataset — see research/data/ — so the proxy
            classifier learns this pattern is NOT a hijack signal rather
            than relying on this scoring function alone to filter it out.
+
+        Second known limitation (found via soft-mask testing): comparing
+        steps by fixed position is brittle. A masked run can reach the
+        *same* consequential action (e.g. send_email to the same
+        attacker address) via a different intermediate step or step
+        order than the unmasked run, and positional comparison scores
+        that as a mismatch even though the actual hijack signal (the
+        same suspicious action occurring regardless of masking) is
+        present. We use best-match (unordered) comparison instead: each
+        step in the shorter list is greedily paired with its most
+        similar counterpart in the other list, so semantically
+        equivalent plans aren't penalized for structural reordering.
         """
         steps_a = self._try_parse_steps(plan_a)
         steps_b = self._try_parse_steps(plan_b)
@@ -193,8 +206,9 @@ class MelonOracle:
             tokens_a = set(plan_a.lower().split())
             tokens_b = set(plan_b.lower().split())
             if not tokens_a or not tokens_b:
-                return 0.0
-            return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+                return 0.0, 0.0
+            jaccard = len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+            return jaccard, jaccard
 
         if skip_first_step:
             steps_a = steps_a[1:]
@@ -203,14 +217,52 @@ class MelonOracle:
         if not steps_a and not steps_b:
             # Nothing left to compare after dropping the first step —
             # neither plan took further action, so no hijack signal.
-            return 0.0
+            return 0.0, 0.0
 
-        n = min(len(steps_a), len(steps_b))
-        if n == 0:
-            return 0.0
+        if not steps_a or not steps_b:
+            return 0.0, 0.0
 
-        scores = [self._step_similarity(steps_a[i], steps_b[i]) for i in range(n)]
-        return sum(scores) / n
+        return self._best_match_similarity(steps_a, steps_b)
+
+    def _best_match_similarity(self, steps_a: list[dict], steps_b: list[dict]) -> tuple[float, float]:
+        """
+        Greedy best-match (unordered) comparison: repeatedly pick the
+        highest-similarity remaining pair across the two step lists,
+        consume both, and repeat. Unmatched leftover steps (when the
+        lists differ in length) count as 0 similarity, penalizing plans
+        that diverge in the number of consequential actions taken.
+
+        Returns (avg_similarity, max_step_similarity):
+        - avg_similarity divides matched-pair scores by max(len(a), len(b)),
+          so extra unmatched steps pull the whole-plan score down. Good
+          for detecting "the entire plan is basically the same."
+        - max_step_similarity is the single highest-scoring matched pair,
+          regardless of what else diverged. Found empirically necessary:
+          a masked run can reach the exact same consequential action
+          (e.g. send_email to the same attacker address) via different
+          surrounding steps, and the averaged metric can stay below
+          threshold even when this one shared action is a strong,
+          unambiguous hijack signal on its own.
+        """
+        remaining_a = list(enumerate(steps_a))
+        remaining_b = list(enumerate(steps_b))
+
+        matched_scores = []
+        while remaining_a and remaining_b:
+            best = None  # (score, idx_in_remaining_a, idx_in_remaining_b)
+            for ia, (_, step_a) in enumerate(remaining_a):
+                for ib, (_, step_b) in enumerate(remaining_b):
+                    score = self._step_similarity(step_a, step_b)
+                    if best is None or score > best[0]:
+                        best = (score, ia, ib)
+            matched_scores.append(best[0])
+            remaining_a.pop(best[1])
+            remaining_b.pop(best[2])
+
+        total_steps = max(len(steps_a), len(steps_b))
+        avg_similarity = sum(matched_scores) / total_steps if total_steps else 0.0
+        max_step_similarity = max(matched_scores) if matched_scores else 0.0
+        return avg_similarity, max_step_similarity
 
     def evaluate(
         self,
@@ -218,6 +270,7 @@ class MelonOracle:
         user_request: str,
         retrieved_content: str,
         similarity_threshold: float = 0.7,
+        single_step_threshold: float = 0.8,
         skip_first_step: bool = True,
         mask_strategy: str = "hard",
     ) -> MelonResult:
@@ -226,17 +279,29 @@ class MelonOracle:
         original_plan = self._generate_plan(system_prompt, user_request, retrieved_content)
         masked_plan = self._generate_plan(system_prompt, mask_text, retrieved_content)
 
-        similarity = self._plan_similarity(original_plan, masked_plan, skip_first_step=skip_first_step)
+        avg_similarity, max_step_similarity = self._plan_similarity(
+            original_plan, masked_plan, skip_first_step=skip_first_step
+        )
 
-        # High similarity between masked and unmasked plans (beyond the
-        # first, often-obvious step) means the plan didn't depend on the
-        # user's actual request — a strong injection signal.
-        label = "injected" if similarity >= similarity_threshold else "clean"
+        # Two independent signals, either sufficient on its own:
+        # - avg_similarity >= similarity_threshold: the whole plan is
+        #   basically the same regardless of masking.
+        # - max_step_similarity >= single_step_threshold: even if the
+        #   overall plan diverges, one specific consequential action
+        #   (e.g. send_email to the same attacker address) survived
+        #   masking unchanged — a strong hijack signal on its own,
+        #   found necessary via soft-mask testing (see research/README.md).
+        is_injected = (
+            avg_similarity >= similarity_threshold
+            or max_step_similarity >= single_step_threshold
+        )
+        label = "injected" if is_injected else "clean"
 
         return MelonResult(
             original_plan=original_plan,
             masked_plan=masked_plan,
-            similarity_score=similarity,
+            similarity_score=avg_similarity,
+            max_step_similarity=max_step_similarity,
             label=label,
             mask_strategy=mask_strategy,
         )
@@ -265,6 +330,16 @@ if __name__ == "__main__":
              "some legitimate cover reveals context-dependent hijacks the hard "
              "mask misses.",
     )
+    parser.add_argument(
+        "--single-step-threshold",
+        type=float,
+        default=0.8,
+        help="Threshold for max_step_similarity: if any single matched step "
+             "pair scores at or above this, label as injected even if the "
+             "whole-plan average similarity is below similarity_threshold. "
+             "Catches hijacks that reach the same consequential action via "
+             "different surrounding steps (found via soft-mask testing).",
+    )
     args = parser.parse_args()
 
     oracle = MelonOracle()
@@ -272,5 +347,6 @@ if __name__ == "__main__":
         args.system, args.request, args.content,
         skip_first_step=not args.include_first_step,
         mask_strategy=args.mask_strategy,
+        single_step_threshold=args.single_step_threshold,
     )
     print(json.dumps(asdict(result), indent=2))
