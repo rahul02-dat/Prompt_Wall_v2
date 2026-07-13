@@ -70,6 +70,8 @@ def run_batch(
             **row,
             "oracle_label": result.label,
             "oracle_similarity": result.similarity_score,
+            "oracle_original_plan": result.original_plan,
+            "oracle_masked_plan": result.masked_plan,
             "agrees_with_expected_label": agrees,
             "latency_sec": round(latency, 3),
         }
