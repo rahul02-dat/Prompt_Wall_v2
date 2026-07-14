@@ -202,13 +202,26 @@ class MelonOracle:
         steps_a = self._try_parse_steps(plan_a)
         steps_b = self._try_parse_steps(plan_b)
 
-        if steps_a is None or steps_b is None:
+        if steps_a is None and steps_b is None:
+            # Neither side parsed — no structured signal at all from either
+            # branch. Token-Jaccard is a weak last resort, but it's the
+            # only information available in this case.
             tokens_a = set(plan_a.lower().split())
             tokens_b = set(plan_b.lower().split())
             if not tokens_a or not tokens_b:
                 return 0.0, 0.0
             jaccard = len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
             return jaccard, jaccard
+
+        if steps_a is None or steps_b is None:
+            # One side parsed, the other didn't (e.g. a refusal sentence
+            # instead of a JSON plan). Comparing structured JSON against
+            # prose via token overlap is close to meaningless — treat the
+            # unparseable side as "no plan taken" (empty list) instead,
+            # which is the honest interpretation and lets the normal
+            # empty-vs-real-plan logic below handle it consistently.
+            steps_a = steps_a if steps_a is not None else []
+            steps_b = steps_b if steps_b is not None else []
 
         if skip_first_step:
             steps_a = steps_a[1:]
