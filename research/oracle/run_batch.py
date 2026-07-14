@@ -55,10 +55,11 @@ def run_batch(
         text = row["text"]
         request = row.get("request", default_request)
         expected_label = row.get("label")
+        system_prompt = row.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
 
         start = time.time()
         result = oracle.evaluate(
-            DEFAULT_SYSTEM_PROMPT, request, text,
+            system_prompt, request, text,
             skip_first_step=skip_first_step,
             mask_strategy=mask_strategy,
         )
