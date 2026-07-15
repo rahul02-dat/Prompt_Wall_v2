@@ -135,7 +135,7 @@ def run_batch(
     if n_with_label:
         print(f"Agreement with expected label: {n_agree}/{n_with_label} ({n_agree/n_with_label:.1%})")
     print(f"Total latency: {total_latency:.2f}s")
-    print(f"Avg latency per example: {avg_latency:.3f}s  <-- use this as --oracle-seconds-per-example")
+    print(f"Avg latency per example: {avg_latency:.3f}s")
 
     # Break out agreement specifically on confounded/subtle-injection examples,
     # since those are the cases the skip_first_step fix was meant to address.
