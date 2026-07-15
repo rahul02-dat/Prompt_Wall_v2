@@ -36,6 +36,7 @@ def run_batch(
     skip_first_step: bool = True,
     default_request: str = DEFAULT_REQUEST,
     mask_strategy: str = "hard",
+    resume: bool = False,
 ):
     oracle = MelonOracle()
 
@@ -46,12 +47,43 @@ def run_batch(
             if line:
                 rows.append(json.loads(line))
 
+    # --- Resume support ---
+    # If --out already exists and --resume is set, load already-completed
+    # rows (matched by "source", which is unique per row across all
+    # datasets in this project) and skip them. Lets a long run (e.g. the
+    # full 1046-example AgentDojo set, likely hours) survive an
+    # interruption — sleep, crash, closed terminal, power loss — without
+    # losing prior progress or needing to redo completed examples.
+    completed_sources = set()
     results = []
-    total_latency = 0.0
+    if resume and out_path and Path(out_path).exists():
+        with open(out_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    prior_row = json.loads(line)
+                except json.JSONDecodeError:
+                    # Last line may be truncated if the process was killed
+                    # mid-write — skip it rather than fail the whole resume.
+                    continue
+                completed_sources.add(prior_row.get("source"))
+                results.append(prior_row)
+        print(f"Resuming: {len(completed_sources)} examples already completed, skipping those.")
 
-    out_f = open(out_path, "w") if out_path else None
+    remaining_rows = [r for r in rows if r.get("source") not in completed_sources]
+    if resume and completed_sources:
+        print(f"{len(remaining_rows)} examples remaining out of {len(rows)} total.")
 
-    for i, row in enumerate(rows):
+    total_latency = sum(r.get("latency_sec", 0) for r in results)
+
+    # Append mode when resuming (preserves prior completed lines), write
+    # mode otherwise. Either way, each line is flushed immediately so a
+    # hard crash loses at most the example in progress, not the whole run.
+    out_f = open(out_path, "a" if resume else "w") if out_path else None
+
+    for i, row in enumerate(remaining_rows):
         text = row["text"]
         request = row.get("request", default_request)
         expected_label = row.get("label")
@@ -84,9 +116,10 @@ def run_batch(
         results.append(out_row)
 
         line_out = json.dumps(out_row)
-        print(f"[{i+1}/{len(rows)}] {line_out}")
+        print(f"[{i+1}/{len(remaining_rows)}] {line_out}")
         if out_f:
             out_f.write(line_out + "\n")
+            out_f.flush()  # ensure each completed example survives a hard crash
 
     if out_f:
         out_f.close()
@@ -144,6 +177,14 @@ if __name__ == "__main__":
              "'soft' = generic-but-plausible request, testing whether it "
              "reduces false negatives on context-dependent hijacks.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from --out if it already exists, skipping examples "
+             "already completed (matched by 'source'). Use this for long "
+             "runs (e.g. the full AgentDojo dataset) that might get "
+             "interrupted by sleep, a crash, or a closed terminal.",
+    )
     args = parser.parse_args()
 
     run_batch(
@@ -151,4 +192,5 @@ if __name__ == "__main__":
         out_path=args.out,
         skip_first_step=not args.include_first_step,
         mask_strategy=args.mask_strategy,
+        resume=args.resume,
     )
