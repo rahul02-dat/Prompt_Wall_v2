@@ -106,12 +106,33 @@ class MelonOracle:
         self._last_token_count = 0
 
     def _generate_plan(self, system_prompt: str, user_request: str, retrieved_content: str,
-                        max_new_tokens: int = 600) -> str:
+                        max_new_tokens: int = 600, no_repeat_ngram_size: int = 12) -> str:
+        """
+        no_repeat_ngram_size=12 is a cheap, generation-time defense against
+        the degenerate looping found on the AgentDojo workspace suite (a
+        real 5-tool-call cycle -- get_file_ids_of_largest_files ->
+        get_file_contents -> send_email -> delete_email -> delete_file --
+        repeated until max_new_tokens was hit). Each repeated step is
+        roughly 15-25 tokens as JSON, so an n-gram window of 12 is chosen
+        to catch repeats without being so large it fails to block them or
+        so small it accidentally forbids legitimate short repeated
+        substrings (e.g. two steps that both use "args": {}).
+        This does NOT fix the separate malformed-JSON problem (missing
+        closing braces, literal "..." placeholders) seen on the same
+        suite -- that needs grammar-constrained decoding or few-shot
+        examples, not a generation-repetition penalty.
+        """
         messages = [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": f"Request: {user_request}\n\nRetrieved content:\n{retrieved_content}\n\nOutput the JSON step list now.",
+                "content": (
+                    f"Request: {user_request}\n\nRetrieved content:\n{retrieved_content}\n\n"
+                    "Output the JSON step list now. Every field must contain a real, concrete "
+                    "value -- never use '...' or any other placeholder. Close every object and "
+                    "the outer array exactly once; do not continue emitting steps after the "
+                    "array has been closed."
+                ),
             },
         ]
         prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -122,6 +143,7 @@ class MelonOracle:
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,  # deterministic — we need reproducible comparisons
+                no_repeat_ngram_size=no_repeat_ngram_size,
             )
 
         new_tokens = output[0][inputs["input_ids"].shape[1]:]

@@ -116,13 +116,16 @@ def try_parse_steps(text: str) -> tuple[list[dict] | None, bool]:
     return None, False  # genuinely no plan / unparseable prose, not truncation
 
 
-def detect_step_repetition(text: str, min_cycle: int = 1, max_cycle: int = 3, min_repeats: int = 3) -> dict:
+def detect_step_repetition(text: str, min_cycle: int = 1, max_cycle: int = 10, min_repeats: int = 3) -> dict:
     """
     Cheap heuristic to distinguish "genuinely needs more tokens" from
     "model is looping" in truncated plans. Extracts the sequence of
     "tool": "..." values in order of appearance and checks whether a
-    short cycle (length 1-3) repeats at least `min_repeats` times
-    in a row anywhere in the sequence.
+    short cycle (length 1-10 by default) repeats at least `min_repeats`
+    times in a row anywhere in the sequence. Widened from an earlier
+    1-3 cap after a real 5-step loop (get_file_ids_of_largest_files ->
+    get_file_contents -> send_email -> delete_email -> delete_file)
+    went undetected on the AgentDojo workspace suite.
 
     Returns {"is_looping": bool, "tool_sequence": [...], "cycle": [...] | None,
              "repeat_count": int}
