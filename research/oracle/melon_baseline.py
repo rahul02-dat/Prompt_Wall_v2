@@ -40,6 +40,11 @@ from dataclasses import dataclass, asdict
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from robust_parse import (
+    detect_step_repetition as _detect_step_repetition,
+    try_parse_steps as _try_parse_steps,
+)
+
 ORACLE_MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
 
 MASK_TOKEN = "[REDACTED USER REQUEST]"
@@ -74,80 +79,15 @@ class MelonResult:
     label: str  # "injected" | "clean"
     original_truncated: bool
     masked_truncated: bool
+    original_token_count: int
+    masked_token_count: int
+    masked_is_looping: bool  # diagnostic: repeating tool-call cycle vs genuine length
+    masked_tool_sequence: list  # diagnostic: tools called in order, for eyeballing
 
 
-# --- Robust, bracket-depth-aware parsing -----------------------------------
-
-def _find_matching_close(text: str, start: int, open_ch: str, close_ch: str) -> int | None:
-    """
-    Given the index of an opening bracket/brace, return the index of its
-    matching close by tracking nesting depth and honoring string escaping.
-    Returns None if it never closes (truncated generation).
-    """
-    depth = 0
-    in_string = False
-    escape = False
-
-    for i in range(start, len(text)):
-        ch = text[i]
-
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-
-        if ch == '"':
-            in_string = True
-        elif ch == open_ch:
-            depth += 1
-        elif ch == close_ch:
-            depth -= 1
-            if depth == 0:
-                return i
-
-    return None
-
-
-def _try_parse_steps(text: str) -> tuple[list[dict] | None, bool]:
-    """
-    Returns (steps_or_None, truncated).
-
-    truncated=True means an array or object was opened but never
-    structurally closed before the text ended (i.e. generation was cut
-    off mid-JSON) — distinct from "model emitted unparseable prose",
-    which returns (None, False).
-    """
-    start = text.find("[")
-    if start != -1:
-        end = _find_matching_close(text, start, "[", "]")
-        if end is not None:
-            try:
-                parsed = json.loads(text[start:end + 1])
-                if isinstance(parsed, list):
-                    return parsed, False
-            except (json.JSONDecodeError, ValueError):
-                pass
-        else:
-            return None, True  # array opened, never closed -> truncated
-
-    # Fallback: single {"tool": ...} dict, same depth-aware approach
-    start = text.find("{")
-    if start != -1:
-        end = _find_matching_close(text, start, "{", "}")
-        if end is None:
-            return None, True  # object opened, never closed -> truncated
-        try:
-            parsed = json.loads(text[start:end + 1])
-            if isinstance(parsed, dict) and "tool" in parsed:
-                return [parsed], False
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    return None, False  # genuinely no plan / unparseable prose
+# Note: bracket-depth-aware step parsing (_try_parse_steps) now lives in
+# robust_parse.py and is imported at the top of this file, rather than
+# being duplicated here.
 
 
 class MelonOracle:
@@ -163,6 +103,7 @@ class MelonOracle:
             torch_dtype=torch.float16,
         ).to(self.device)
         self.model.eval()
+        self._last_token_count = 0
 
     def _generate_plan(self, system_prompt: str, user_request: str, retrieved_content: str,
                         max_new_tokens: int = 600) -> str:
@@ -183,7 +124,9 @@ class MelonOracle:
                 do_sample=False,  # deterministic — we need reproducible comparisons
             )
 
-        generated = self.tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        new_tokens = output[0][inputs["input_ids"].shape[1]:]
+        generated = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        self._last_token_count = len(new_tokens)  # exposed for truncation diagnostics
         return generated.strip()
 
     def _step_similarity(self, step_a: dict, step_b: dict) -> float:
@@ -237,10 +180,14 @@ class MelonOracle:
         mask_text = SOFT_MASK_TOKEN if mask_strategy == "soft" else MASK_TOKEN
 
         original_plan = self._generate_plan(system_prompt, user_request, retrieved_content, max_new_tokens)
+        original_token_count = self._last_token_count
         masked_plan = self._generate_plan(system_prompt, mask_text, retrieved_content, max_new_tokens)
+        masked_token_count = self._last_token_count
 
         steps_a, original_truncated = _try_parse_steps(original_plan)
         steps_b, masked_truncated = _try_parse_steps(masked_plan)
+
+        rep_info = _detect_step_repetition(masked_plan)
 
         similarity, max_step_sim = self._plan_similarity(steps_a, steps_b, skip_first_step=skip_first_step)
 
@@ -254,6 +201,10 @@ class MelonOracle:
             label=label,
             original_truncated=original_truncated,
             masked_truncated=masked_truncated,
+            original_token_count=original_token_count,
+            masked_token_count=masked_token_count,
+            masked_is_looping=rep_info["is_looping"],
+            masked_tool_sequence=rep_info["tool_sequence"],
         )
 
 

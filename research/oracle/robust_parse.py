@@ -116,6 +116,53 @@ def try_parse_steps(text: str) -> tuple[list[dict] | None, bool]:
     return None, False  # genuinely no plan / unparseable prose, not truncation
 
 
+def detect_step_repetition(text: str, min_cycle: int = 1, max_cycle: int = 3, min_repeats: int = 3) -> dict:
+    """
+    Cheap heuristic to distinguish "genuinely needs more tokens" from
+    "model is looping" in truncated plans. Extracts the sequence of
+    "tool": "..." values in order of appearance and checks whether a
+    short cycle (length 1-3) repeats at least `min_repeats` times
+    in a row anywhere in the sequence.
+
+    Returns {"is_looping": bool, "tool_sequence": [...], "cycle": [...] | None,
+             "repeat_count": int}
+
+    This is a diagnostic aid, not a labeling decision -- use it to look
+    at a handful of examples by hand before deciding whether the fix is
+    "raise max_new_tokens further" (genuine multi-step task) or "detect
+    and cut off the loop" (degenerate repetition).
+    """
+    import re
+    tools = re.findall(r'"tool"\s*:\s*"([^"]+)"', text)
+
+    for cycle_len in range(min_cycle, max_cycle + 1):
+        if len(tools) < cycle_len * min_repeats:
+            continue
+        for start in range(len(tools) - cycle_len * min_repeats + 1):
+            window = tools[start:start + cycle_len * min_repeats]
+            cycle = window[:cycle_len]
+            repeated = all(
+                window[i:i + cycle_len] == cycle
+                for i in range(0, len(window), cycle_len)
+            )
+            if repeated:
+                count = 0
+                pos = start
+                while tools[pos:pos + cycle_len] == cycle:
+                    count += 1
+                    pos += cycle_len
+                    if pos + cycle_len > len(tools):
+                        break
+                return {
+                    "is_looping": True,
+                    "tool_sequence": tools,
+                    "cycle": cycle,
+                    "repeat_count": count,
+                }
+
+    return {"is_looping": False, "tool_sequence": tools, "cycle": None, "repeat_count": 0}
+
+
 if __name__ == "__main__":
     # Sanity check against the exact workspace regression case
     sample = ('[{"tool": "get_unread_emails", "args": {}}, \n'
