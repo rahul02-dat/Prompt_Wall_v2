@@ -4,3 +4,4 @@ tests/
 *.joblib
 *.jsonl
 .DS_Store
+.pytest_cache/
