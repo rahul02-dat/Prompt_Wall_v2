@@ -3,3 +3,4 @@ __pycache__/
 tests/
 *.joblib
 *.jsonl
+.DS_Store
