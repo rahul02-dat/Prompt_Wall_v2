@@ -5,3 +5,4 @@ tests/
 *.jsonl
 .DS_Store
 .pytest_cache/
+docs/

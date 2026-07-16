@@ -38,11 +38,12 @@ import json
 from dataclasses import dataclass, asdict
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 from robust_parse import (
     detect_step_repetition as _detect_step_repetition,
     try_parse_steps as _try_parse_steps,
+    array_is_closed as _array_is_closed,
 )
 
 ORACLE_MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
@@ -90,6 +91,50 @@ class MelonResult:
 # being duplicated here.
 
 
+class ArrayCloseStoppingCriteria(StoppingCriteria):
+    """
+    Halts generation the moment the outer JSON array's bracket depth
+    returns to 0 -- i.e. the instant a structurally complete plan exists
+    -- instead of relying on the model to self-terminate or on a
+    repetition penalty to guess when it's "gone on too long".
+
+    This directly targets the looping failure mode found on the
+    AgentDojo workspace suite (a real 5-step cycle -- get_file_ids_of_
+    largest_files -> get_file_contents -> send_email -> delete_email ->
+    delete_file -- that ran until max_new_tokens was hit). A repetition
+    penalty (no_repeat_ngram_size) was tried first and made things worse
+    (longer, still looping) because small wording variations between
+    repeats dodged the n-gram window. Checking bracket depth doesn't
+    need to recognize "repetition" at all -- it just stops at the
+    structurally correct point, whatever the model was going to do next.
+
+    Only checks periodically (every `check_every` new tokens) since
+    decoding+scanning the full generated text on every single token step
+    would be wasteful.
+    """
+
+    def __init__(self, tokenizer, prompt_len: int, check_every: int = 4):
+        self.tokenizer = tokenizer
+        self.prompt_len = prompt_len
+        self.check_every = check_every
+        self._steps_since_check = 0
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        self._steps_since_check += 1
+        if self._steps_since_check < self.check_every:
+            return False
+        self._steps_since_check = 0
+
+        generated_ids = input_ids[0][self.prompt_len:]
+        # Only decode once we've generated enough to plausibly contain
+        # an opening bracket -- avoids wasted decode calls very early on.
+        if generated_ids.shape[0] < 3:
+            return False
+
+        text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        return _array_is_closed(text)
+
+
 class MelonOracle:
     def __init__(self, model_id: str = ORACLE_MODEL_ID, device: str | None = None):
         self.device = device or (
@@ -106,44 +151,46 @@ class MelonOracle:
         self._last_token_count = 0
 
     def _generate_plan(self, system_prompt: str, user_request: str, retrieved_content: str,
-                        max_new_tokens: int = 600, no_repeat_ngram_size: int = 12) -> str:
+                        max_new_tokens: int = 600) -> str:
         """
-        no_repeat_ngram_size=12 is a cheap, generation-time defense against
-        the degenerate looping found on the AgentDojo workspace suite (a
-        real 5-tool-call cycle -- get_file_ids_of_largest_files ->
-        get_file_contents -> send_email -> delete_email -> delete_file --
-        repeated until max_new_tokens was hit). Each repeated step is
-        roughly 15-25 tokens as JSON, so an n-gram window of 12 is chosen
-        to catch repeats without being so large it fails to block them or
-        so small it accidentally forbids legitimate short repeated
-        substrings (e.g. two steps that both use "args": {}).
-        This does NOT fix the separate malformed-JSON problem (missing
-        closing braces, literal "..." placeholders) seen on the same
-        suite -- that needs grammar-constrained decoding or few-shot
-        examples, not a generation-repetition penalty.
+        Uses ArrayCloseStoppingCriteria instead of a repetition penalty:
+        no_repeat_ngram_size was tried and made things worse on the
+        looping workspace examples (417/815 tokens, still looping --
+        the model dodged the n-gram window with small wording variations
+        between repeats rather than actually stopping). A hard stop the
+        instant the outer JSON array closes is more surgical: it doesn't
+        try to guess what "repetition" looks like, it just ends generation
+        at the structurally correct point regardless of what the model
+        would have done next.
+
+        The extra prompt wording about placeholders/closing (added in the
+        previous iteration) is reverted here -- it measurably made the
+        looping cases worse (longer, still broken) while only some
+        anecdotal-looking benefit elsewhere. Prompt-wording changes to
+        fix formatting were unpredictable across task types; the
+        mechanical fixes (stopping criteria + repair fallback) are more
+        reliable and don't have that risk.
         """
         messages = [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": (
-                    f"Request: {user_request}\n\nRetrieved content:\n{retrieved_content}\n\n"
-                    "Output the JSON step list now. Every field must contain a real, concrete "
-                    "value -- never use '...' or any other placeholder. Close every object and "
-                    "the outer array exactly once; do not continue emitting steps after the "
-                    "array has been closed."
-                ),
+                "content": f"Request: {user_request}\n\nRetrieved content:\n{retrieved_content}\n\nOutput the JSON step list now.",
             },
         ]
         prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+
+        stopping_criteria = StoppingCriteriaList([
+            ArrayCloseStoppingCriteria(self.tokenizer, inputs["input_ids"].shape[1])
+        ])
 
         with torch.no_grad():
             output = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,  # deterministic — we need reproducible comparisons
-                no_repeat_ngram_size=no_repeat_ngram_size,
+                stopping_criteria=stopping_criteria,
             )
 
         new_tokens = output[0][inputs["input_ids"].shape[1]:]
