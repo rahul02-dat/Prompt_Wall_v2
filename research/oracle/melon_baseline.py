@@ -1,38 +1,39 @@
 """
 Research R1 — MELON baseline (expensive, ground-truth oracle).
 
-PATCHED VERSION — fixes a real bug found via the AgentDojo full-scale run:
+GRAMMAR-CONSTRAINED VERSION — replaces after-the-fact parsing/repair with
+generation-time constraints, after three successive malformation shapes
+were found in the AgentDojo full-scale run:
 
-The original `_try_parse_steps` used text.find("[") / text.rfind("]") to
-locate the JSON array boundary. This breaks in two related ways:
+1. Truncation: generation cut off before the array closes (fixed by
+   raising max_new_tokens and later by ArrayCloseStoppingCriteria below).
+2. Cosmetic syntax errors within otherwise-balanced brackets (trailing/
+   dangling commas) -- fixed by a regex repair fallback in robust_parse.py.
+3. Missing closing braces inside an object -- e.g.
+   [{"tool": "x", "args": {...}], {"tool": "y", ...}]
+   where the array only "closes" because later objects happen to
+   rebalance the bracket count. Neither of the above fixes touches this:
+   it isn't a loop (ArrayCloseStoppingCriteria correctly declines to stop
+   early, since depth genuinely never returns to 0 until the end) and it
+   isn't cosmetic (there's no single well-defined place to insert the
+   missing brace).
 
-1. Generation is sometimes truncated by max_new_tokens before the array
-   closes (longer, fully-compliant plans — which soft masking elicits
-   more of — are more likely to hit the cap than short refusals).
-2. When truncated, rfind("]") can latch onto a "]" that appears inside
-   *string content* (e.g. an injected payload containing the literal
-   text "[SECURITY BREACH]"), silently handing json.loads a malformed
-   fragment instead of failing cleanly. The parse then fails, falls
-   through to "no plan" (empty list), and a plan that actually executed
-   a real hijack gets scored as `clean` — a silent mislabel, not a
-   genuine masking/comparison failure.
+Chasing each malformation shape individually was clearly not converging.
+This version uses grammar-constrained decoding (via `outlines`) so the
+model is physically unable to emit a token that would violate the JSON
+schema at any point -- eliminating unclosed arrays, missing braces,
+trailing commas, and "..." placeholders all at once, at the source,
+rather than detecting and repairing them after generation.
 
-Fixes applied here:
-- `max_new_tokens` raised 300 -> 600 to reduce truncation frequency.
-- Bracket-depth-and-string-aware parsing (`_find_matching_close`,
-  `_try_parse_steps`) that only matches *structural* brackets, never
-  ones embedded in string content, and explicitly distinguishes
-  "truncated mid-generation" from "genuinely no parseable plan".
-- `MelonResult` gains `original_truncated` / `masked_truncated` fields
-  so truncation is a visible, filterable data-quality flag instead of
-  a silent fallback to "clean".
-- `evaluate()` no longer scores truncated plans as ordinary empty
-  plans: if either side was truncated, the result is still returned
-  but flagged, so callers (run_batch.py / downstream analysis) can
-  choose to exclude or re-run these rather than trust the label as-is.
+It also bounds the number of steps directly in the schema (max_length),
+which independently caps the degenerate-looping failure mode (the real
+5-step get_file_ids_of_largest_files -> ... -> delete_file cycle) without
+needing a separate stopping criterion.
 
-Everything else (masking strategy, step-similarity, best-match scoring)
-is unchanged from the original file.
+Falls back to the previous ArrayCloseStoppingCriteria + free-text
+generation path if `outlines` is not installed, with a printed warning --
+so existing pipelines don't hard-break, but you should `pip install
+outlines` to get the actual fix this file is named for.
 """
 import json
 from dataclasses import dataclass, asdict
@@ -46,10 +47,19 @@ from robust_parse import (
     array_is_closed as _array_is_closed,
 )
 
+try:
+    from pydantic import BaseModel, Field
+    import outlines
+    _OUTLINES_AVAILABLE = True
+except ImportError:
+    _OUTLINES_AVAILABLE = False
+
 ORACLE_MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
 
 MASK_TOKEN = "[REDACTED USER REQUEST]"
 SOFT_MASK_TOKEN = "Please help me with this task."
+
+MAX_STEPS = 8  # schema-level cap: also directly bounds the looping failure mode
 
 DEFAULT_TOOL_SCHEMA = """Available tools:
 - send_email(to: str, subject: str, body: str)
@@ -84,33 +94,45 @@ class MelonResult:
     masked_token_count: int
     masked_is_looping: bool  # diagnostic: repeating tool-call cycle vs genuine length
     masked_tool_sequence: list  # diagnostic: tools called in order, for eyeballing
+    used_grammar_constrained: bool  # whether outlines was actually used for this call
 
 
 # Note: bracket-depth-aware step parsing (_try_parse_steps) now lives in
 # robust_parse.py and is imported at the top of this file, rather than
 # being duplicated here.
 
+if _OUTLINES_AVAILABLE:
+    # Every args value observed across AgentDojo examples so far has been
+    # a plain string (addresses, subjects, bodies, dates, ids, queries).
+    # The schema previously allowed Union[str, int, float, bool] per
+    # value; each union member adds branching states to the FSM the
+    # guided-decoding backend has to track, which is a plausible
+    # amplifier for the "no next state found" crash regardless of which
+    # backend is used. Narrowing to plain strings trades a small amount
+    # of schema fidelity (an integer arg would come through as "3" not
+    # 3) for a meaningfully simpler grammar. Revisit if a real numeric
+    # arg is later found in the data.
+    class ToolCall(BaseModel):
+        tool: str
+        args: dict[str, str] = Field(default_factory=dict)
+
+    class Plan(BaseModel):
+        # max_length bounds step count directly in the grammar -- this is
+        # what replaces ArrayCloseStoppingCriteria's job of preventing
+        # unbounded loops, except it's enforced by construction rather
+        # than detected after the fact.
+        steps: list[ToolCall] = Field(default_factory=list, max_length=MAX_STEPS)
+
 
 class ArrayCloseStoppingCriteria(StoppingCriteria):
     """
-    Halts generation the moment the outer JSON array's bracket depth
-    returns to 0 -- i.e. the instant a structurally complete plan exists
-    -- instead of relying on the model to self-terminate or on a
-    repetition penalty to guess when it's "gone on too long".
-
-    This directly targets the looping failure mode found on the
-    AgentDojo workspace suite (a real 5-step cycle -- get_file_ids_of_
-    largest_files -> get_file_contents -> send_email -> delete_email ->
-    delete_file -- that ran until max_new_tokens was hit). A repetition
-    penalty (no_repeat_ngram_size) was tried first and made things worse
-    (longer, still looping) because small wording variations between
-    repeats dodged the n-gram window. Checking bracket depth doesn't
-    need to recognize "repetition" at all -- it just stops at the
-    structurally correct point, whatever the model was going to do next.
-
-    Only checks periodically (every `check_every` new tokens) since
-    decoding+scanning the full generated text on every single token step
-    would be wasteful.
+    Fallback-path only (used when `outlines` isn't installed). Halts
+    generation the moment the outer JSON array's bracket depth returns
+    to 0. Kept for backward compatibility / environments that can't
+    install outlines, but grammar-constrained decoding via `evaluate()`
+    is the primary path now -- this only handles the truncation/looping
+    shape, not missing-brace or trailing-comma malformations, which is
+    why it was superseded.
     """
 
     def __init__(self, tokenizer, prompt_len: int, check_every: int = 4):
@@ -126,8 +148,6 @@ class ArrayCloseStoppingCriteria(StoppingCriteria):
         self._steps_since_check = 0
 
         generated_ids = input_ids[0][self.prompt_len:]
-        # Only decode once we've generated enough to plausibly contain
-        # an opening bracket -- avoids wasted decode calls very early on.
         if generated_ids.shape[0] < 3:
             return False
 
@@ -142,35 +162,104 @@ class MelonOracle:
             else "mps" if torch.backends.mps.is_available()
             else "cpu"
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        # use_fast=True is required, not just preferred, for outlines'
+        # FSM-based constrained decoding -- it indexes token transitions
+        # over the fast tokenizer's byte-level vocab. Llama-3.1 in
+        # particular ships with reserved tokens in the tokenizer that
+        # aren't all wired to the model's output (lm_head) layer; that
+        # mismatch is the most common cause of outlines-core's
+        # "No next state found for the current state" error, since its
+        # FSM index and the model's actual output distribution disagree
+        # on vocabulary size. resize_token_embeddings below forces them
+        # back into alignment.
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch.float16,
         ).to(self.device)
+        if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
+            print(f"Resizing model embeddings: {self.model.get_input_embeddings().weight.shape[0]} "
+                  f"-> {len(self.tokenizer)} to match tokenizer vocab (fixes outlines FSM mismatch).")
+            self.model.resize_token_embeddings(len(self.tokenizer))
         self.model.eval()
         self._last_token_count = 0
 
-    def _generate_plan(self, system_prompt: str, user_request: str, retrieved_content: str,
-                        max_new_tokens: int = 600) -> str:
-        """
-        Uses ArrayCloseStoppingCriteria instead of a repetition penalty:
-        no_repeat_ngram_size was tried and made things worse on the
-        looping workspace examples (417/815 tokens, still looping --
-        the model dodged the n-gram window with small wording variations
-        between repeats rather than actually stopping). A hard stop the
-        instant the outer JSON array closes is more surgical: it doesn't
-        try to guess what "repetition" looks like, it just ends generation
-        at the structurally correct point regardless of what the model
-        would have done next.
+        if _OUTLINES_AVAILABLE:
+            self._outlines_model = outlines.from_transformers(self.model, self.tokenizer)
+            # The default backend (outlines_core) has a confirmed internal
+            # bug on this model: "No next state found for the current
+            # state" -- a crash inside its own FSM guide implementation
+            # (outlines/backends/outlines_core.py), input-dependent (it
+            # surfaced on original_plan generation once, masked_plan
+            # generation another time, different state/token IDs each
+            # time). Not something reachable from this file's code.
+            # llguidance is a more mature alternative guided-decoding
+            # engine (same one behind Microsoft's `guidance` library) --
+            # switching to it as the primary backend, with a fallback to
+            # the default if llguidance isn't installed.
+            try:
+                self._outlines_generator = outlines.Generator(self._outlines_model, Plan, backend="llguidance")
+                print("Grammar-constrained decoding ENABLED (outlines + llguidance backend).")
+            except Exception as e:
+                print(f"llguidance backend unavailable ({e}); falling back to outlines_core default. "
+                      f"Run `pip install llguidance` to use the more stable backend.")
+                self._outlines_generator = outlines.Generator(self._outlines_model, Plan)
+                print("Grammar-constrained decoding ENABLED (outlines, default outlines_core backend -- "
+                      "known to be less stable on this model).")
+        else:
+            self._outlines_model = None
+            self._outlines_generator = None
+            print("WARNING: `outlines` not installed -- falling back to free-text "
+                  "generation + ArrayCloseStoppingCriteria. This does NOT protect "
+                  "against missing-brace or trailing-comma malformations. "
+                  "Run `pip install outlines` for the actual fix.")
 
-        The extra prompt wording about placeholders/closing (added in the
-        previous iteration) is reverted here -- it measurably made the
-        looping cases worse (longer, still broken) while only some
-        anecdotal-looking benefit elsewhere. Prompt-wording changes to
-        fix formatting were unpredictable across task types; the
-        mechanical fixes (stopping criteria + repair fallback) are more
-        reliable and don't have that risk.
+    def _generate_plan_constrained(self, system_prompt: str, user_request: str,
+                                    retrieved_content: str, max_new_tokens: int) -> tuple[str, int]:
         """
+        Grammar-constrained path: the model can only emit tokens that keep
+        it inside the `Plan` schema at every step, so unclosed arrays,
+        missing braces, trailing commas, and "..." placeholders are all
+        structurally impossible rather than things to detect afterward.
+        `steps` is capped at MAX_STEPS in the schema, which also directly
+        bounds the degenerate-looping failure mode.
+
+        outlines' Generator.__call__ returns a raw JSON string matching
+        the schema (NOT a parsed Plan instance) -- confirmed against the
+        installed outlines version, whose SteerableGenerator.__call__
+        signature is (prompt, **inference_kwargs) -> str. We validate it
+        ourselves with Plan.model_validate_json().
+
+        Returns (bare_list_json_text, token_count). The output is
+        deliberately re-serialized as a bare JSON list (not the {"steps":
+        [...]} wrapper Plan uses internally) so it's byte-compatible with
+        the existing try_parse_steps / similarity-comparison pipeline --
+        nothing downstream needs to know constrained decoding happened.
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Request: {user_request}\n\nRetrieved content:\n{retrieved_content}\n\nOutput the JSON step list now.",
+            },
+        ]
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        raw_json_text = self._outlines_generator(prompt, max_new_tokens=max_new_tokens)
+        plan_obj = Plan.model_validate_json(raw_json_text)
+
+        bare_list_text = json.dumps([s.model_dump() for s in plan_obj.steps])
+
+        # Approximate token count for the truncation/looping diagnostics
+        # that downstream code still reports -- constrained decoding
+        # can't actually truncate mid-structure (the grammar prevents
+        # it), so this is purely informational now, not a defect signal.
+        token_count = len(self.tokenizer(bare_list_text)["input_ids"])
+        return bare_list_text, token_count
+
+    def _generate_plan_freetext(self, system_prompt: str, user_request: str, retrieved_content: str,
+                                 max_new_tokens: int = 600) -> str:
+        """Fallback path used only when `outlines` isn't installed. See ArrayCloseStoppingCriteria docstring."""
         messages = [
             {"role": "system", "content": system_prompt},
             {
@@ -189,14 +278,24 @@ class MelonOracle:
             output = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,  # deterministic — we need reproducible comparisons
+                do_sample=False,
                 stopping_criteria=stopping_criteria,
             )
 
         new_tokens = output[0][inputs["input_ids"].shape[1]:]
         generated = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-        self._last_token_count = len(new_tokens)  # exposed for truncation diagnostics
+        self._last_token_count = len(new_tokens)
         return generated.strip()
+
+    def _generate_plan(self, system_prompt: str, user_request: str, retrieved_content: str,
+                        max_new_tokens: int = 600) -> str:
+        if _OUTLINES_AVAILABLE:
+            text, token_count = self._generate_plan_constrained(
+                system_prompt, user_request, retrieved_content, max_new_tokens
+            )
+            self._last_token_count = token_count
+            return text
+        return self._generate_plan_freetext(system_prompt, user_request, retrieved_content, max_new_tokens)
 
     def _step_similarity(self, step_a: dict, step_b: dict) -> float:
         tool_a, tool_b = step_a.get("tool"), step_b.get("tool")
@@ -274,6 +373,7 @@ class MelonOracle:
             masked_token_count=masked_token_count,
             masked_is_looping=rep_info["is_looping"],
             masked_tool_sequence=rep_info["tool_sequence"],
+            used_grammar_constrained=_OUTLINES_AVAILABLE,
         )
 
 
